@@ -35,8 +35,9 @@ _creds: List[dict] = []
 _album_tracks_sem = asyncio.Semaphore(20)
 
 
-def _build_http_client() -> httpx.AsyncClient:
+def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(
+        proxy=proxy_url,
         http2=True,
         timeout=httpx.Timeout(connect=3.0, read=12.0, write=8.0, pool=12.0),
         limits=httpx.Limits(
@@ -51,7 +52,15 @@ def _build_http_client() -> httpx.AsyncClient:
 async def lifespan(app: FastAPI):
     global _http_client
     if _http_client is None:
-        _http_client = _build_http_client()
+        proxy_url = None
+        if USE_PROXIES:
+            proxy_url = await get_working_proxy()
+            if not proxy_url and not FALLBACK_TO_DIRECT_CONNECTION:
+                logger.error("Could not find a working proxy and FALLBACK_TO_DIRECT_CONNECTION is False. Shutting down.")
+                raise RuntimeError("No working proxies available")
+            elif not proxy_url and FALLBACK_TO_DIRECT_CONNECTION:
+                logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
+        _http_client = _build_http_client(proxy_url)
     try:
         yield
     finally:
@@ -82,6 +91,63 @@ REFRESH_TOKEN: Optional[str] = os.getenv("REFRESH_TOKEN")
 USER_ID = os.getenv("USER_ID")
 TOKEN_FILE = os.getenv("TOKEN_FILE", "token.json")
 COUNTRY_CODE = os.getenv("COUNTRY_CODE", "US")
+
+USE_PROXIES = os.getenv("USE_PROXIES", "False").lower() in ("true", "1", "yes")
+ROTATE_PROXIES_ON_REFRESH = os.getenv("ROTATE_PROXIES_ON_REFRESH", "False").lower() in ("true", "1", "yes")
+PROXIES_FILE = os.getenv("PROXIES_FILE", "proxies.txt")
+FALLBACK_TO_DIRECT_CONNECTION = os.getenv("FALLBACK_TO_DIRECT_CONNECTION", "False").lower() in ("true", "1", "yes")
+
+async def test_proxy(proxy_url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=5.0) as client:
+            resp = await client.get("http://example.com")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+async def get_working_proxy() -> Optional[str]:
+    if not os.path.exists(PROXIES_FILE):
+        logger.warning(f"Proxies file {PROXIES_FILE} not found.")
+        return None
+    with open(PROXIES_FILE, "r") as f:
+        proxies = [line.strip() for line in f if line.strip()]
+    
+    if not proxies:
+        return None
+
+    for _ in range(min(10, len(proxies))):
+        proxy = random.choice(proxies)
+        if not proxy.startswith("http"):
+            proxy = f"http://{proxy}"
+        
+        if await test_proxy(proxy):
+            return proxy
+            
+    return None
+
+async def _delayed_close(client: httpx.AsyncClient):
+    await asyncio.sleep(15)
+    await client.aclose()
+
+async def update_global_client(force_new_proxy: bool = False):
+    global _http_client
+    async with _http_client_lock:
+        proxy_url = None
+        if USE_PROXIES:
+            proxy_url = await get_working_proxy()
+            if not proxy_url:
+                if FALLBACK_TO_DIRECT_CONNECTION:
+                    logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
+                else:
+                    logger.error("Could not find a working proxy and FALLBACK_TO_DIRECT_CONNECTION is False.")
+                    raise HTTPException(status_code=503, detail="No working proxies available")
+        
+        new_client = _build_http_client(proxy_url)
+        old_client = _http_client
+        _http_client = new_client
+        
+        if old_client is not None:
+            asyncio.create_task(_delayed_close(old_client))
 
 if os.path.exists(TOKEN_FILE):
     with open(TOKEN_FILE, "r") as tok:
@@ -142,7 +208,14 @@ async def get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
         async with _http_client_lock:
             if _http_client is None:
-                _http_client = _build_http_client()
+                proxy_url = None
+                if USE_PROXIES:
+                    proxy_url = await get_working_proxy()
+                    if not proxy_url and not FALLBACK_TO_DIRECT_CONNECTION:
+                        raise HTTPException(status_code=503, detail="Service Unavailable")
+                    elif not proxy_url and FALLBACK_TO_DIRECT_CONNECTION:
+                        logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
+                _http_client = _build_http_client(proxy_url)
     return _http_client
 
 
@@ -154,29 +227,54 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
         if cred["access_token"] and time.time() < cred["expires_at"]:
             return cred["access_token"]
 
-        try:
-            client = await get_http_client()
-            res = await client.post(
-                "https://auth.tidal.com/v1/oauth2/token",
-                data={
-                    "client_id": cred["client_id"],
-                    "refresh_token": cred["refresh_token"],
-                    "grant_type": "refresh_token",
-                    "scope": "r_usr+w_usr+w_sub",
-                },
-                auth=(cred["client_id"], cred["client_secret"]),
-            )
-            res.raise_for_status()
-            data = res.json()
-            new_token = data["access_token"]
-            expires_in = data.get("expires_in", 3600)
+        if USE_PROXIES and ROTATE_PROXIES_ON_REFRESH:
+            await update_global_client(force_new_proxy=True)
 
-            cred["access_token"] = new_token
-            cred["expires_at"] = time.time() + expires_in - 60
+        max_retries = 2 if USE_PROXIES else 1
+        for attempt in range(max_retries):
+            try:
+                client = await get_http_client()
+                res = await client.post(
+                    "https://auth.tidal.com/v1/oauth2/token",
+                    data={
+                        "client_id": cred["client_id"],
+                        "refresh_token": cred["refresh_token"],
+                        "grant_type": "refresh_token",
+                        "scope": "r_usr+w_usr+w_sub",
+                    },
+                    auth=(cred["client_id"], cred["client_secret"]),
+                )
+                
+                if res.status_code in [400, 401]:
+                    try:
+                        error_data = res.json()
+                        if error_data.get("error") in ["invalid_client", "invalid_grant"]:
+                            logger.error(f"Tidal Auth Error: {error_data}")
+                            raise HTTPException(status_code=401, detail=f"Tidal Auth Error: {error_data.get('error_description')}")
+                    except ValueError:
+                        pass
+                
+                res.raise_for_status()
+                data = res.json()
+                new_token = data["access_token"]
+                expires_in = data.get("expires_in", 3600)
 
-            return new_token
-        except httpx.HTTPError as e:
-            raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
+                cred["access_token"] = new_token
+                cred["expires_at"] = time.time() + expires_in - 60
+
+                return new_token
+            except httpx.RequestError as e:
+                if USE_PROXIES and attempt < max_retries - 1:
+                    logger.warning(f"Proxy failed during token refresh: {e}. Healing proxy...")
+                    await update_global_client(force_new_proxy=True)
+                    continue
+                raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
+            except httpx.HTTPStatusError as e:
+                if USE_PROXIES and e.response.status_code in [403, 429] and attempt < max_retries - 1:
+                    logger.warning(f"Proxy blocked during token refresh ({e.response.status_code}). Healing proxy...")
+                    await update_global_client(force_new_proxy=True)
+                    continue
+                raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
 
 
 async def get_tidal_token(force_refresh: bool = False):
