@@ -34,6 +34,9 @@ _creds: List[dict] = []
 # Global semaphore to limit concurrent album track fetches across all requests
 _album_tracks_sem = asyncio.Semaphore(20)
 
+# List of proxies loaded from file at startup
+_proxies: List[str] = []
+
 
 def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -98,6 +101,18 @@ PROXIES_FILE = os.getenv("PROXIES_FILE", "proxies.txt")
 FALLBACK_TO_DIRECT_CONNECTION = os.getenv("FALLBACK_TO_DIRECT_CONNECTION", "False").lower() in ("true", "1", "yes")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 
+def load_proxies():
+    """Load proxies from file into the global _proxies list."""
+    global _proxies
+    if not os.path.exists(PROXIES_FILE):
+        logger.warning(f"Proxies file {PROXIES_FILE} not found.")
+        _proxies = []
+        return
+    with open(PROXIES_FILE, "r") as f:
+        _proxies = [line.strip() for line in f if line.strip()]
+    logger.info(f"Loaded {len(_proxies)} proxies.")
+
+
 async def test_proxy(proxy_url: str) -> bool:
     try:
         async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=5.0) as client:
@@ -106,24 +121,25 @@ async def test_proxy(proxy_url: str) -> bool:
     except Exception:
         return False
 
-async def get_working_proxy() -> Optional[str]:
-    if not os.path.exists(PROXIES_FILE):
-        logger.warning(f"Proxies file {PROXIES_FILE} not found.")
-        return None
-    with open(PROXIES_FILE, "r") as f:
-        proxies = [line.strip() for line in f if line.strip()]
-    
-    if not proxies:
+
+async def get_working_proxy(avoid_proxy: Optional[str] = None) -> Optional[str]:
+    if not _proxies:
         return None
 
-    for _ in range(min(10, len(proxies))):
-        proxy = random.choice(proxies)
-        if not proxy.startswith("http"):
-            proxy = f"http://{proxy}"
-        
+    shuffled_proxies = _proxies[:]
+    random.shuffle(shuffled_proxies)
+
+    if avoid_proxy:
+        candidate_proxies = [p for p in shuffled_proxies if p != avoid_proxy]
+        if not candidate_proxies:
+            candidate_proxies = shuffled_proxies
+    else:
+        candidate_proxies = shuffled_proxies
+
+    for proxy in candidate_proxies:
         if await test_proxy(proxy):
             return proxy
-            
+
     return None
 
 async def _delayed_close(client: httpx.AsyncClient):
@@ -133,22 +149,34 @@ async def _delayed_close(client: httpx.AsyncClient):
 async def update_global_client(force_new_proxy: bool = False):
     global _http_client
     async with _http_client_lock:
+        proxy_to_avoid = None
+        if force_new_proxy and _http_client and _http_client.proxy:
+            proxy_to_avoid = str(_http_client.proxy.url)
+
         proxy_url = None
         if USE_PROXIES:
-            proxy_url = await get_working_proxy()
+            proxy_url = await get_working_proxy(avoid_proxy=proxy_to_avoid)
             if not proxy_url:
                 if FALLBACK_TO_DIRECT_CONNECTION:
                     logger.warning("Could not find a working proxy, falling back to direct connection. HOST IP MAY BE EXPOSED!")
                 else:
                     logger.error("Could not find a working proxy and FALLBACK_TO_DIRECT_CONNECTION is False.")
-                    raise HTTPException(status_code=503, detail="No working proxies available")
-        
+                    raise HTTPException(status_code=503, detail="Service Unavailable")
+
+        # Only create a new client if the proxy is actually different
+        if _http_client and str(_http_client.proxy.url if _http_client.proxy else None) == proxy_url:
+            return
+
         new_client = _build_http_client(proxy_url)
         old_client = _http_client
         _http_client = new_client
-        
+
         if old_client is not None:
             asyncio.create_task(_delayed_close(old_client))
+
+
+if USE_PROXIES:
+    load_proxies()
 
 if os.path.exists(TOKEN_FILE):
     with open(TOKEN_FILE, "r") as tok:
