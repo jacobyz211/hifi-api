@@ -37,6 +37,9 @@ _album_tracks_sem = asyncio.Semaphore(20)
 # List of proxies loaded from file at startup
 _proxies: List[str] = []
 
+# Cache of the last proxy confirmed to be working
+_last_known_good_proxy: Optional[str] = None
+
 
 def _build_http_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
     return httpx.AsyncClient(
@@ -99,6 +102,10 @@ USE_PROXIES = os.getenv("USE_PROXIES", "False").lower() in ("true", "1", "yes")
 ROTATE_PROXIES_ON_REFRESH = os.getenv("ROTATE_PROXIES_ON_REFRESH", "False").lower() in ("true", "1", "yes")
 PROXIES_FILE = os.getenv("PROXIES_FILE", "proxies.txt")
 FALLBACK_TO_DIRECT_CONNECTION = os.getenv("FALLBACK_TO_DIRECT_CONNECTION", "False").lower() in ("true", "1", "yes")
+# Maximum number of proxy candidates to test per get_working_proxy() call
+MAX_PROXY_CANDIDATES = 10
+# Maximum number of concurrent proxy tests inside get_working_proxy()
+_PROXY_TEST_CONCURRENCY = 5
 _max_retries_raw = os.getenv("MAX_RETRIES", "2")
 try:
     MAX_RETRIES = int(_max_retries_raw)
@@ -120,7 +127,7 @@ def load_proxies():
 
 async def test_proxy(proxy_url: str) -> bool:
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, verify=False, timeout=5.0) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=5.0) as client:
             resp = await client.get("http://example.com")
             return resp.status_code == 200
     except Exception:
@@ -128,8 +135,15 @@ async def test_proxy(proxy_url: str) -> bool:
 
 
 async def get_working_proxy(avoid_proxy: Optional[str] = None) -> Optional[str]:
+    global _last_known_good_proxy
+
     if not _proxies:
         return None
+
+    # Try the cached proxy first (unless it is the one we want to avoid)
+    if _last_known_good_proxy and _last_known_good_proxy != avoid_proxy:
+        if await test_proxy(_last_known_good_proxy):
+            return _last_known_good_proxy
 
     shuffled_proxies = _proxies[:]
     random.shuffle(shuffled_proxies)
@@ -141,11 +155,32 @@ async def get_working_proxy(avoid_proxy: Optional[str] = None) -> Optional[str]:
     else:
         candidate_proxies = shuffled_proxies
 
-    for proxy in candidate_proxies:
-        if await test_proxy(proxy):
-            return proxy
+    # Exclude the already-tested cached proxy and cap the candidate list
+    if _last_known_good_proxy:
+        candidate_proxies = [p for p in candidate_proxies if p != _last_known_good_proxy]
+    candidate_proxies = candidate_proxies[:MAX_PROXY_CANDIDATES]
 
-    return None
+    # Test candidates concurrently, returning the first one that succeeds
+    sem = asyncio.Semaphore(_PROXY_TEST_CONCURRENCY)
+    found_event = asyncio.Event()
+    selected_proxy: List[Optional[str]] = [None]
+
+    async def probe(proxy: str) -> None:
+        if found_event.is_set():
+            return
+        async with sem:
+            if found_event.is_set():
+                return
+            if await test_proxy(proxy):
+                if not found_event.is_set():
+                    selected_proxy[0] = proxy
+                    found_event.set()
+
+    await asyncio.gather(*[probe(p) for p in candidate_proxies], return_exceptions=True)
+
+    if selected_proxy[0]:
+        _last_known_good_proxy = selected_proxy[0]
+    return selected_proxy[0]
 
 async def _delayed_close(client: httpx.AsyncClient):
     await asyncio.sleep(15)
