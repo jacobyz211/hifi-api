@@ -121,16 +121,9 @@ MAX_PROXY_CANDIDATES = 10
 _PROXY_TEST_CONCURRENCY = 5
 _max_retries_raw = os.getenv("MAX_RETRIES", "2")
 _USER_AGENTS = [
-    "Dalvik/2.1.0 (Linux; U; Android 14; SM-S928B Build/AP2A.240905.003)",
-    "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 8 Pro Build/AP2A.240905.003)",
-    "Dalvik/2.1.0 (Linux; U; Android 14; SM-G998B Build/UP1A.231005.007)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; SM-A546B Build/TP1A.220624.014)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; Pixel 7 Build/TQ3A.230901.001)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; SM-S911B Build/TP1A.220624.014)",
-    "Dalvik/2.1.0 (Linux; U; Android 12; SM-G991B Build/SP1A.210812.016)",
-    "Dalvik/2.1.0 (Linux; U; Android 12; Pixel 6 Build/SP2A.220405.004)",
-    "Dalvik/2.1.0 (Linux; U; Android 14; OnePlus CPH2423 Build/AP2A.240905.003)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; moto g84 5G Build/U1TDS33.73-27)",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
 _custom_ua = os.getenv("USER_AGENT")
@@ -151,8 +144,8 @@ def _tidal_headers(extra: dict | None = None) -> dict:
         "Accept": "*/*",
         "Accept-Encoding": "gzip",
         "Accept-Language": "en-US,en;q=0.9",
-        "X-Platform": "android",
-        "X-Tidal-Platform": "android",
+        "X-Platform": "DESKTOP",
+        "X-Tidal-Platform": "DESKTOP",
     }
     if extra:
         h.update(extra)
@@ -406,6 +399,12 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
 
                 cred["access_token"] = new_token
                 cred["expires_at"] = time.time() + expires_in - 60
+
+                # Save rotated refresh token if Tidal returns a new one
+                new_refresh = data.get("refresh_token")
+                if new_refresh and new_refresh != cred["refresh_token"]:
+                    logger.info("[token] Refresh token rotated — updating in memory")
+                    cred["refresh_token"] = new_refresh
 
                 return new_token
             except httpx.RequestError as e:
