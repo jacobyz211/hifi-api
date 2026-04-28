@@ -4,7 +4,6 @@ import os
 import random
 import webbrowser
 from pathlib import Path
-import base64
 
 import httpx
 import rich
@@ -22,6 +21,7 @@ _custom_ua = os.getenv("USER_AGENT")
 
 def _random_ua() -> str:
     return _custom_ua if _custom_ua else random.choice(_USER_AGENTS)
+
 
 CLIENT_ID = "zU4XHVVkc2tDPo4t"
 CLIENT_SECRET = "VJKhDFqJPqvsPVNBV6ukXTJmwlvbttP7wlMlrc72se4="
