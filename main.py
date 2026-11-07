@@ -39,6 +39,9 @@ _creds: List[dict] = []
 # kept out of the playback pool and is not request-serialized.
 _catalog_cred: Optional[dict] = None
 
+# Built later from _creds; named here so the token-file reloader can test it.
+_playback_pool = None
+
 # Global semaphore to limit concurrent album track fetches across all requests
 _album_tracks_sem = asyncio.Semaphore(20)
 
@@ -296,74 +299,196 @@ async def update_global_client(force_new_proxy: bool = False):
 if USE_PROXIES:
     load_proxies()
 
-if os.path.exists(TOKEN_FILE):
-    with open(TOKEN_FILE, "r") as tok:
-        token_data = json.load(tok)
+_ENV_CLIENT_ID = CLIENT_ID
+_ENV_CLIENT_SECRET = CLIENT_SECRET
+_ENV_REFRESH_TOKEN = REFRESH_TOKEN
+_ENV_USER_ID = USER_ID
+_TOKEN_FILE_MTIME = 0.0
+
+
+def _credential_from_entry(entry: dict) -> dict:
+    return {
+        "client_id": entry.get("client_ID") or _ENV_CLIENT_ID,
+        "client_secret": entry.get("client_secret") or _ENV_CLIENT_SECRET,
+        "refresh_token": entry.get("refresh_token") or _ENV_REFRESH_TOKEN,
+        "user_id": entry.get("userID") or _ENV_USER_ID,
+        # Access tokens in file have unknown expiry; force refresh on first use
+        "access_token": None,
+        "expires_at": 0,
+        # When the last refresh of this account was refused. The root
+        # endpoint uses it to report the instance as unusable.
+        "_failed_at": 0,
+        # When this account last answered with a PREVIEW clip. Free-tier
+        # accounts stay in token.json but are skipped for playback once seen.
+        "_preview_at": 0,
+    }
+
+
+def _carry_live_state(old: List[dict], new: List[dict]) -> None:
+    """Keep a still-valid access token when the same account stays in the pool."""
+    by_refresh = {c.get("refresh_token"): c for c in old}
+    for cred in new:
+        prev = by_refresh.get(cred.get("refresh_token"))
+        if prev is None:
+            continue
+        cred["access_token"] = prev.get("access_token")
+        cred["expires_at"] = prev.get("expires_at", 0) or 0
+        cred["_failed_at"] = prev.get("_failed_at", 0) or 0
+        cred["_preview_at"] = prev.get("_preview_at", 0) or 0
+
+
+def reload_credentials(force: bool = False) -> bool:
+    """Re-read token.json when it changes, so adding an account needs no restart.
+
+    A restart used to be the only way to load a new account, and it also threw
+    away every in-memory access token (forcing N refreshes at once). This keeps
+    live tokens for accounts that are still present and swaps the pool only
+    when the set of accounts actually changed.
+    """
+    global _creds, _catalog_cred, _playback_pool, _TOKEN_FILE_MTIME
+    global CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN
+
+    try:
+        mtime = os.path.getmtime(TOKEN_FILE)
+    except OSError:
+        if not force:
+            return False
+        mtime = 0.0
+    if not force and mtime and mtime == _TOKEN_FILE_MTIME:
+        return False
+    _TOKEN_FILE_MTIME = mtime
+
+    new_creds: List[dict] = []
+    new_catalog: Optional[dict] = None
+    if mtime:
+        try:
+            with open(TOKEN_FILE, "r") as tok:
+                token_data = json.load(tok)
+        except Exception as exc:
+            logger.warning("Could not reload %s: %s", TOKEN_FILE, exc)
+            return False
         if isinstance(token_data, dict):
             token_data = [token_data]
-
         for entry in token_data:
+            if not isinstance(entry, dict):
+                continue
+            cred = _credential_from_entry(entry)
+            if not cred["refresh_token"]:
+                continue
             is_catalog = entry.get("role") == "catalog" or entry.get("catalog") is True
-            cred = {
-                "client_id": entry.get("client_ID") or CLIENT_ID,
-                "client_secret": entry.get("client_secret") or CLIENT_SECRET,
-                "refresh_token": entry.get("refresh_token") or REFRESH_TOKEN,
-                "user_id": entry.get("userID") or USER_ID,
-                # Access tokens in file have unknown expiry; force refresh on first use
-                "access_token": None,
-                "expires_at": 0,
-            }
-            if cred["refresh_token"]:
-                if is_catalog:
-                    if _catalog_cred is None:
-                        _catalog_cred = cred
-                    else:
-                        logger.warning("Ignoring additional catalog credential in %s", TOKEN_FILE)
-                elif not any(c["refresh_token"] == cred["refresh_token"] for c in _creds):
-                    _creds.append(cred)
+            if is_catalog:
+                if new_catalog is None:
+                    new_catalog = cred
+                else:
+                    logger.warning("Ignoring additional catalog credential in %s", TOKEN_FILE)
+            elif not any(c["refresh_token"] == cred["refresh_token"] for c in new_creds):
+                new_creds.append(cred)
 
-# Add env var credential if available and unique (simple check)
-if REFRESH_TOKEN:
-    env_cred = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "refresh_token": REFRESH_TOKEN,
-        "user_id": USER_ID,
-        "access_token": None,
-        "expires_at": 0,
-    }
-    # Avoid adding duplicate if it was already loaded from file with same refresh token
-    if not any(c["refresh_token"] == REFRESH_TOKEN for c in _creds):
-        _creds.append(env_cred)
+    # Add env var credential if available and unique (simple check)
+    if _ENV_REFRESH_TOKEN and not any(c["refresh_token"] == _ENV_REFRESH_TOKEN for c in new_creds):
+        new_creds.append({
+            "client_id": _ENV_CLIENT_ID,
+            "client_secret": _ENV_CLIENT_SECRET,
+            "refresh_token": _ENV_REFRESH_TOKEN,
+            "user_id": _ENV_USER_ID,
+            "access_token": None,
+            "expires_at": 0,
+            "_failed_at": 0,
+        })
 
-if _catalog_cred is None and CATALOG_REFRESH_TOKEN:
-    _catalog_cred = {
-        "client_id": CATALOG_CLIENT_ID,
-        "client_secret": CATALOG_CLIENT_SECRET,
-        "refresh_token": CATALOG_REFRESH_TOKEN,
-        "user_id": CATALOG_USER_ID,
-        "access_token": None,
-        "expires_at": 0,
-    }
+    if new_catalog is None and CATALOG_REFRESH_TOKEN:
+        new_catalog = {
+            "client_id": CATALOG_CLIENT_ID,
+            "client_secret": CATALOG_CLIENT_SECRET,
+            "refresh_token": CATALOG_REFRESH_TOKEN,
+            "user_id": CATALOG_USER_ID,
+            "access_token": None,
+            "expires_at": 0,
+        }
 
-if _catalog_cred is not None:
-    # A credential explicitly reserved for catalog traffic must never also
-    # become a playback slot, even if it was duplicated via environment vars.
-    _creds[:] = [
-        cred for cred in _creds
-        if cred["refresh_token"] != _catalog_cred["refresh_token"]
-    ]
+    if new_catalog is not None:
+        # A credential explicitly reserved for catalog traffic must never also
+        # become a playback slot, even if it was duplicated via environment vars.
+        new_creds = [
+            cred for cred in new_creds
+            if cred["refresh_token"] != new_catalog["refresh_token"]
+        ]
+        if _catalog_cred is not None:
+            _carry_live_state([_catalog_cred], [new_catalog])
 
-if _creds:
-    CLIENT_ID = _creds[0]["client_id"]
-    CLIENT_SECRET = _creds[0]["client_secret"]
-    REFRESH_TOKEN = _creds[0]["refresh_token"]
+    _carry_live_state(_creds, new_creds)
+    changed = (
+        [c["refresh_token"] for c in new_creds]
+        != [c["refresh_token"] for c in _creds]
+    )
+    _creds[:] = new_creds
+    _catalog_cred = new_catalog
+    if changed and _playback_pool is not None:
+        _playback_pool = PlaybackCredentialPool(_creds)
+    if _creds:
+        CLIENT_ID = _creds[0]["client_id"]
+        CLIENT_SECRET = _creds[0]["client_secret"]
+        REFRESH_TOKEN = _creds[0]["refresh_token"]
+    logger.info("Loaded %d playback credential(s) from %s", len(_creds), TOKEN_FILE)
+    return True
+
+
+reload_credentials(force=True)
+
+
+FAILED_COOLDOWN_SECONDS = 300
+# A PREVIEW answer means the account has no active subscription
+# (previewReason=FULL_REQUIRES_SUBSCRIPTION). Keep it out of playback for six
+# hours; a plan can be restored, so this is a cooldown rather than a deletion.
+PREVIEW_COOLDOWN_SECONDS = 6 * 60 * 60
+
+
+def _is_failed(cred: dict) -> bool:
+    """True while a refused credential is in its cooldown window."""
+    at = cred.get("_failed_at") or 0
+    return bool(at) and (time.time() - at) < FAILED_COOLDOWN_SECONDS
+
+
+def _is_preview_broken(cred: dict) -> bool:
+    """True while a free-tier account is in its preview cooldown window."""
+    at = cred.get("_preview_at") or 0
+    return bool(at) and (time.time() - at) < PREVIEW_COOLDOWN_SECONDS
+
+
+def _is_preview_response(result: Any) -> bool:
+    """True for a 200 that only contains a 30-second PREVIEW asset.
+
+    /trackManifests wraps Tidal's payload under data.data.attributes; /track
+    returns data.assetPresentation directly.
+    """
+    if not isinstance(result, dict):
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    inner = data.get("data")
+    if isinstance(inner, dict):
+        attrs = inner.get("attributes") or {}
+        presentation = attrs.get("trackPresentation")
+        if presentation:
+            return str(presentation).upper() != "FULL"
+    presentation = data.get("assetPresentation")
+    if presentation:
+        return str(presentation).upper() != "FULL"
+    return False
 
 
 def _pick_credential() -> dict:
+    reload_credentials()
     if not _creds:
         raise HTTPException(status_code=500, detail="No Tidal credentials available; populate token.json")
-    return random.choice(_creds)
+    # Prefer accounts that are neither refused nor preview-only. Fall back to
+    # merely-not-refused, then to everything, so a pool of free-tier accounts
+    # still answers instead of dead-ending the request.
+    healthy = [c for c in _creds if not _is_failed(c) and not _is_preview_broken(c)]
+    if not healthy:
+        healthy = [c for c in _creds if not _is_failed(c)]
+    return random.choice(healthy or _creds)
 
 
 def _lock_for_cred(cred: dict) -> asyncio.Lock:
@@ -485,12 +610,25 @@ def _pending_playback_response(job: PlaybackJob) -> JSONResponse:
 
 async def _run_queued_playback_job(job: PlaybackJob) -> None:
     try:
-        async with _playback_pool.lease() as cred:
-            job.state = "processing"
-            if job.operation is None:
-                raise RuntimeError("Playback operation is missing")
-            job.result = await job.operation(cred)
-            job.state = "completed"
+        job.state = "processing"
+        if job.operation is None:
+            raise RuntimeError("Playback operation is missing")
+        # Same preview guard as the immediate path: a free-tier draw is marked
+        # and retried with the next leased account instead of being returned.
+        last_preview = None
+        attempts = max(1, min(_playback_pool.size, 6))
+        for _ in range(attempts):
+            async with _playback_pool.lease() as cred:
+                result = await job.operation(cred)
+                if not _is_preview_response(result):
+                    cred["_preview_at"] = 0
+                    job.result = result
+                    job.state = "completed"
+                    return
+                cred["_preview_at"] = time.time()
+                last_preview = result
+        job.result = last_preview
+        job.state = "completed"
     except asyncio.CancelledError:
         job.state = "cancelled"
         raise
@@ -509,13 +647,33 @@ async def _run_queued_playback_job(job: PlaybackJob) -> None:
 
 
 async def dispatch_playback_request(operation: Callable[[dict], Awaitable[Any]]):
-    """Run immediately when possible; otherwise return a pollable 202 job."""
+    """Run immediately when possible; otherwise return a pollable 202 job.
+
+    A preview answer means the account behind the request has no subscription.
+    Mark it preview-broken and immediately retry with the next leased account
+    so a client is never handed a 30-second clip just because the pool drew a
+    free-tier account.
+    """
     cred = _playback_pool.try_acquire()
     if cred is not None:
-        try:
-            return await operation(cred)
-        finally:
-            _playback_pool.release(cred)
+        last_preview = None
+        attempts = max(1, min(_playback_pool.size, 6))
+        for _ in range(attempts):
+            try:
+                result = await operation(cred)
+            finally:
+                _playback_pool.release(cred)
+            if not _is_preview_response(result):
+                cred["_preview_at"] = 0
+                return result
+            cred["_preview_at"] = time.time()
+            last_preview = result
+            cred = _playback_pool.try_acquire()
+            if cred is None:
+                break
+        if last_preview is not None:
+            return last_preview
+        # Every credential was busy during the retries - queue a job.
 
     _prune_playback_jobs()
     job = PlaybackJob(
@@ -577,6 +735,7 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
                         error_data = res.json()
                         if error_data.get("error") in ["invalid_client", "invalid_grant"]:
                             logger.error(f"Tidal Auth Error: {error_data}")
+                            cred["_failed_at"] = time.time()
                             raise HTTPException(status_code=401, detail=f"Tidal Auth Error: {error_data.get('error_description')}")
                     except ValueError:
                         pass
@@ -588,15 +747,23 @@ async def refresh_tidal_token(cred: Optional[dict] = None):
 
                 cred["access_token"] = new_token
                 cred["expires_at"] = time.time() + expires_in - 60
+                cred["_failed_at"] = 0
 
                 return new_token
             except httpx.RequestError as e:
+                # A transport error is the network, not a refused account.
+                # Marking the credential dead here made one blip look like a
+                # revoked login and demoted the whole instance.
                 if USE_PROXIES and attempt < max_retries - 1:
                     logger.warning(f"Proxy failed during token refresh: {e}. Healing proxy...")
                     await update_global_client(force_new_proxy=True)
                     continue
                 raise HTTPException(status_code=401, detail=f"Token refresh failed: {str(e)}")
             except httpx.HTTPStatusError as e:
+                # Only a refused login condemns the account. 429/5xx are
+                # transient and must not take the credential out of rotation.
+                if e.response.status_code in (401, 403):
+                    cred["_failed_at"] = time.time()
                 if USE_PROXIES and e.response.status_code in [403, 429] and attempt < max_retries - 1:
                     logger.warning(f"Proxy blocked during token refresh ({e.response.status_code}). Healing proxy...")
                     await update_global_client(force_new_proxy=True)
@@ -621,6 +788,7 @@ async def get_tidal_token_for_cred(force_refresh: bool = False, cred: Optional[d
 
 async def get_catalog_token_for_cred(force_refresh: bool = False, cred: Optional[dict] = None):
     """Return the unrestricted catalog credential, falling back for compatibility."""
+    reload_credentials()
     if cred is not None:
         return await get_tidal_token_for_cred(force_refresh=force_refresh, cred=cred)
     if _catalog_cred is not None:
@@ -817,6 +985,21 @@ async def cancel_playback_request(request_id: str):
 
 @app.get("/")
 async def index():
+    # The tidy addon's health probe hits this to decide whether this
+    # instance is worth trying. An instance whose Tidal credentials are dead
+    # answers every playback request with a 401, so answering "healthy" here
+    # made the addon queue it FIRST on every track - it is the fastest to
+    # reach, being the closest - and every first play of a lossless track
+    # paid for a doomed probe before the working instance was reached.
+    # A failure is remembered per credential, so a transient hiccup on one
+    # of several accounts does not condemn the instance.
+    if _creds:
+        broken = [c for c in _creds if _is_failed(c)]
+        if len(broken) == len(_creds):
+            raise HTTPException(
+                status_code=503,
+                detail="Tidal credentials for every account have been refused",
+            )
     return {"version": API_VERSION, "Repo": "https://github.com/binimum/hifi-api"}
 
 @app.get("/info/")
