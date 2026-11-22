@@ -76,6 +76,7 @@ def test_dispatch_collapses_identical_pending_requests():
         main._playback_pool = main.PlaybackCredentialPool([{"userID": 1}])
         main._playback_jobs.clear()
         main._playback_jobs_by_key.clear()
+        main.PLAYBACK_QUEUE_HOLD = 0
         gate = asyncio.Event()
 
         async def slow(_cred):
@@ -101,11 +102,35 @@ def test_dispatch_collapses_identical_pending_requests():
     _run(scenario())
 
 
+def test_acquire_waits_for_a_free_account_instead_of_failing():
+    async def scenario():
+        pool = main.PlaybackCredentialPool([{"userID": 1}])
+        held = pool.try_acquire()
+
+        async def hand_back():
+            await asyncio.sleep(0.05)
+            pool.release(held)
+
+        asyncio.create_task(hand_back())
+        cred = await pool.acquire(timeout=2)
+        assert cred is not None and cred["userID"] == 1
+        pool.release(cred)
+        assert pool.available == 1
+        # A timed-out wait must not consume the account.
+        held = pool.try_acquire()
+        assert await pool.acquire(timeout=0.05) is None
+        pool.release(held)
+        assert pool.available == 1
+
+    _run(scenario())
+
+
 def test_stalled_job_gets_a_terminal_answer():
     async def scenario():
         main._playback_pool = main.PlaybackCredentialPool([{"userID": 1}])
         main._playback_jobs.clear()
         main._playback_jobs_by_key.clear()
+        main.PLAYBACK_QUEUE_HOLD = 0
 
         async def never(_cred):
             await asyncio.sleep(3600)

@@ -194,6 +194,15 @@ try:
     PLAYBACK_MAX_PENDING_JOBS = int(os.getenv("PLAYBACK_MAX_PENDING_JOBS", "200"))
 except ValueError:
     PLAYBACK_MAX_PENDING_JOBS = 200
+# How long a request waits for a free account before it is answered with 202.
+# Answering immediately made a busy instance look broken to clients that give
+# up on a queued reply; a short wait turns most of those into a real stream.
+# Kept under the 8 s a client waits for a manifest, so a held request can
+# still answer with the stream it was holding for.
+try:
+    PLAYBACK_QUEUE_HOLD = float(os.getenv("PLAYBACK_QUEUE_HOLD", "5"))
+except ValueError:
+    PLAYBACK_QUEUE_HOLD = 5.0
 _PLAYBACK_WATCHDOG_INTERVAL = 5.0
 
 def _log_response(method: str, url: str, resp: httpx.Response):
@@ -589,6 +598,17 @@ class PlaybackCredentialPool:
             return
         self._available.put_nowait(cred)
 
+    async def acquire(self, timeout: float, owner: Optional[str] = None) -> Optional[dict]:
+        """Wait up to ``timeout`` for a free account instead of failing at once."""
+        if self._size == 0:
+            raise HTTPException(status_code=500, detail="No Tidal playback credentials available; populate token.json")
+        try:
+            cred = await asyncio.wait_for(self._available.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        self._track(cred, owner)
+        return cred
+
     @asynccontextmanager
     async def lease(self, owner: Optional[str] = None) -> AsyncIterator[dict]:
         if self._size == 0:
@@ -828,6 +848,8 @@ async def dispatch_playback_request(operation: Callable[[dict], Awaitable[Any]],
             return _pending_playback_response(existing)
 
     cred = _playback_pool.try_acquire()
+    if cred is None and PLAYBACK_QUEUE_HOLD > 0:
+        cred = await _playback_pool.acquire(PLAYBACK_QUEUE_HOLD)
     if cred is not None:
         last_preview = None
         attempts = max(1, min(_playback_pool.size, 6))
@@ -1150,6 +1172,7 @@ async def get_playback_state():
             "leaseTimeoutSeconds": PLAYBACK_LEASE_TIMEOUT,
             "jobTimeoutSeconds": PLAYBACK_JOB_TIMEOUT,
             "maxPendingJobs": PLAYBACK_MAX_PENDING_JOBS,
+            "queueHoldSeconds": PLAYBACK_QUEUE_HOLD,
         },
     }
 
