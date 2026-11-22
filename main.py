@@ -102,8 +102,10 @@ async def lifespan(app: FastAPI):
         _http_client = _build_http_client(proxy_url)
         _http_client_proxy_url = proxy_url
     try:
+        start_playback_watchdog()
         yield
     finally:
+        await stop_playback_watchdog()
         if _http_client:
             await _http_client.aclose()
             _http_client = None
@@ -174,6 +176,25 @@ DEV_MODE = os.getenv("DEV_MODE", "False").lower() in ("true", "1", "yes")
 _RATE_LIMIT_MAX_RETRIES = 3
 _RATE_LIMIT_BASE_DELAY = 1.0
 _RATE_LIMIT_MAX_DELAY = 10.0
+
+# Playback queue hardening. A slot that is never returned wedges the whole
+# instance: once every account is held, every playback request is answered
+# with 202 and nothing ever completes, so clients report "no playable
+# stream". These limits let the instance heal itself instead of waiting for
+# a restart.
+try:
+    PLAYBACK_LEASE_TIMEOUT = float(os.getenv("PLAYBACK_LEASE_TIMEOUT", "90"))
+except ValueError:
+    PLAYBACK_LEASE_TIMEOUT = 90.0
+try:
+    PLAYBACK_JOB_TIMEOUT = float(os.getenv("PLAYBACK_JOB_TIMEOUT", "180"))
+except ValueError:
+    PLAYBACK_JOB_TIMEOUT = 180.0
+try:
+    PLAYBACK_MAX_PENDING_JOBS = int(os.getenv("PLAYBACK_MAX_PENDING_JOBS", "200"))
+except ValueError:
+    PLAYBACK_MAX_PENDING_JOBS = 200
+_PLAYBACK_WATCHDOG_INTERVAL = 5.0
 
 def _log_response(method: str, url: str, resp: httpx.Response):
     if not DEV_MODE:
@@ -500,12 +521,38 @@ def _lock_for_cred(cred: dict) -> asyncio.Lock:
     return lock
 
 
+def _task_brief(task: Optional[asyncio.Task]) -> Optional[str]:
+    """Where a task is currently suspended, for the lease report."""
+    if task is None or task.done():
+        return None
+    try:
+        frames = task.get_stack()
+    except Exception:
+        return None
+    if not frames:
+        return None
+    parts = [
+        f"{frame.f_code.co_name} ({os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno})"
+        for frame in frames[-6:]
+    ]
+    return " < ".join(parts)
+
+
 class PlaybackCredentialPool:
-    """Lease each playback credential to at most one request at a time."""
+    """Lease each playback credential to at most one request at a time.
+
+    Every lease remembers the task that took it and when. A slot that is held
+    past PLAYBACK_LEASE_TIMEOUT is reclaimed by the watchdog, because one
+    wedged request used to hold a slot forever and, with every slot held, the
+    instance answered 202 to every playback request and never recovered
+    without a restart.
+    """
 
     def __init__(self, credentials: List[dict]):
         self._available: asyncio.Queue[dict] = asyncio.Queue()
         self._size = len(credentials)
+        self._members = {id(cred) for cred in credentials}
+        self._leases: Dict[int, dict] = {}
         for cred in credentials:
             self._available.put_nowait(cred)
 
@@ -517,27 +564,62 @@ class PlaybackCredentialPool:
     def available(self) -> int:
         return self._available.qsize()
 
-    def try_acquire(self) -> Optional[dict]:
+    def _track(self, cred: dict, owner: Optional[str] = None) -> None:
+        self._leases[id(cred)] = {
+            "cred": cred,
+            "task": asyncio.current_task(),
+            "at": time.time(),
+            "owner": owner,
+        }
+
+    def try_acquire(self, owner: Optional[str] = None) -> Optional[dict]:
         if self._size == 0:
             raise HTTPException(status_code=500, detail="No Tidal playback credentials available; populate token.json")
         try:
-            return self._available.get_nowait()
+            cred = self._available.get_nowait()
         except asyncio.QueueEmpty:
             return None
+        self._track(cred, owner)
+        return cred
 
     def release(self, cred: dict) -> None:
+        # Only the first release of a lease counts. A reclaimed or already
+        # returned credential must not be handed out twice.
+        if self._leases.pop(id(cred), None) is None:
+            return
         self._available.put_nowait(cred)
 
     @asynccontextmanager
-    async def lease(self) -> AsyncIterator[dict]:
+    async def lease(self, owner: Optional[str] = None) -> AsyncIterator[dict]:
         if self._size == 0:
             raise HTTPException(status_code=500, detail="No Tidal playback credentials available; populate token.json")
 
         cred = await self._available.get()
+        self._track(cred, owner)
         try:
             yield cred
         finally:
             self.release(cred)
+
+    def stale(self, timeout: float) -> List[dict]:
+        now = time.time()
+        return [
+            {**info, "age": now - info["at"]}
+            for info in list(self._leases.values())
+            if now - info["at"] >= timeout
+        ]
+
+    def report(self) -> List[dict]:
+        now = time.time()
+        return [
+            {
+                "account": str(info["cred"].get("userID") or info["cred"].get("user_id") or "?"),
+                "ageSeconds": round(now - info["at"], 1),
+                "requestId": info.get("owner"),
+                "awaiting": _task_brief(info["task"]),
+            }
+            for info in list(self._leases.values())
+        ]
 
 
 _playback_pool = PlaybackCredentialPool(_creds)
@@ -557,7 +639,16 @@ class PlaybackJob:
 
 
 _playback_jobs: Dict[str, PlaybackJob] = {}
+# Identical requests collapse onto one job. Clients retry the same playback
+# URL while it is pending, and every retry used to create another job: the
+# queue only grew while the pool was busy.
+_playback_jobs_by_key: Dict[tuple, str] = {}
 _PLAYBACK_JOB_TTL_SECONDS = 300
+_playback_watchdog_task: Optional[asyncio.Task] = None
+
+
+def _active_job_count() -> int:
+    return sum(1 for job in _playback_jobs.values() if job.state in ("pending", "processing"))
 
 
 def _prune_playback_jobs() -> None:
@@ -569,6 +660,78 @@ def _prune_playback_jobs() -> None:
     ]
     for request_id in expired:
         _playback_jobs.pop(request_id, None)
+    for key, request_id in list(_playback_jobs_by_key.items()):
+        if request_id not in _playback_jobs:
+            _playback_jobs_by_key.pop(key, None)
+
+
+def _fail_job(job: PlaybackJob, detail: str, status: int = 503) -> None:
+    """Give a queued job a terminal answer instead of leaving it pending."""
+    if job.state not in ("pending", "processing"):
+        return
+    job.state = "failed"
+    job.error = detail
+    job.error_status = status
+    job.finished_at = time.time()
+    if job.task is not None and not job.task.done():
+        job.task.cancel()
+
+
+def _expire_stalled_jobs() -> None:
+    """Fail jobs that waited longer than PLAYBACK_JOB_TIMEOUT."""
+    now = time.time()
+    for job in list(_playback_jobs.values()):
+        if job.state in ("pending", "processing") and now - job.created_at >= PLAYBACK_JOB_TIMEOUT:
+            logger.warning(
+                "Playback request %s waited %.0fs for a free account; failing it",
+                job.request_id,
+                now - job.created_at,
+            )
+            _fail_job(job, "Playback queue waited too long for a free account")
+
+
+async def _playback_watchdog() -> None:
+    """Reclaim playback slots that a request never gave back."""
+    while True:
+        await asyncio.sleep(_PLAYBACK_WATCHDOG_INTERVAL)
+        try:
+            for info in _playback_pool.stale(PLAYBACK_LEASE_TIMEOUT):
+                cred = info["cred"]
+                logger.error(
+                    "Reclaiming playback slot for account %s after %.0fs (request %s, task %s, awaiting %s)",
+                    cred.get("userID") or cred.get("user_id") or "?",
+                    info["age"],
+                    info.get("owner"),
+                    getattr(info.get("task"), "get_name", lambda: None)(),
+                    _task_brief(info.get("task")),
+                )
+                job = _playback_jobs.get(info.get("owner") or "")
+                if job is not None:
+                    _fail_job(job, "Playback account slot timed out")
+                _playback_pool.release(cred)
+            _expire_stalled_jobs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Playback watchdog failed")
+
+
+def start_playback_watchdog() -> None:
+    global _playback_watchdog_task
+    if _playback_watchdog_task is None or _playback_watchdog_task.done():
+        _playback_watchdog_task = asyncio.create_task(_playback_watchdog())
+
+
+async def stop_playback_watchdog() -> None:
+    global _playback_watchdog_task
+    if _playback_watchdog_task is None:
+        return
+    _playback_watchdog_task.cancel()
+    try:
+        await _playback_watchdog_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    _playback_watchdog_task = None
 
 
 def _playback_job_position(job: PlaybackJob) -> int:
@@ -618,7 +781,7 @@ async def _run_queued_playback_job(job: PlaybackJob) -> None:
         last_preview = None
         attempts = max(1, min(_playback_pool.size, 6))
         for _ in range(attempts):
-            async with _playback_pool.lease() as cred:
+            async with _playback_pool.lease(owner=job.request_id) as cred:
                 result = await job.operation(cred)
                 if not _is_preview_response(result):
                     cred["_preview_at"] = 0
@@ -646,14 +809,24 @@ async def _run_queued_playback_job(job: PlaybackJob) -> None:
         job.operation = None
 
 
-async def dispatch_playback_request(operation: Callable[[dict], Awaitable[Any]]):
+async def dispatch_playback_request(operation: Callable[[dict], Awaitable[Any]], key: Optional[tuple] = None):
     """Run immediately when possible; otherwise return a pollable 202 job.
 
     A preview answer means the account behind the request has no subscription.
     Mark it preview-broken and immediately retry with the next leased account
     so a client is never handed a 30-second clip just because the pool drew a
     free-tier account.
+
+    ``key`` identifies the request. While an identical request is still
+    pending, its job is returned instead of queueing another one, so a client
+    retrying a 202 cannot bury the instance in duplicate jobs.
     """
+    if key is not None:
+        existing_id = _playback_jobs_by_key.get(key)
+        existing = _playback_jobs.get(existing_id) if existing_id else None
+        if existing is not None and existing.state in ("pending", "processing"):
+            return _pending_playback_response(existing)
+
     cred = _playback_pool.try_acquire()
     if cred is not None:
         last_preview = None
@@ -676,12 +849,20 @@ async def dispatch_playback_request(operation: Callable[[dict], Awaitable[Any]])
         # Every credential was busy during the retries - queue a job.
 
     _prune_playback_jobs()
+    if _active_job_count() >= PLAYBACK_MAX_PENDING_JOBS:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Playback queue is full; retry shortly"},
+            headers={"Retry-After": "2"},
+        )
     job = PlaybackJob(
         request_id=uuid.uuid4().hex,
         operation=operation,
         created_at=time.time(),
     )
     _playback_jobs[job.request_id] = job
+    if key is not None:
+        _playback_jobs_by_key[key] = job.request_id
     job.task = asyncio.create_task(_run_queued_playback_job(job))
     return _pending_playback_response(job)
 
@@ -946,6 +1127,33 @@ async def make_playback_request(url: str, params: Optional[dict] = None):
         return await make_playback_request_for_cred(cred, url, params=params)
 
 
+@app.get("/playback/state")
+async def get_playback_state():
+    """What the playback queue and every account slot are doing right now."""
+    _prune_playback_jobs()
+    counts: Dict[str, int] = {}
+    for job in _playback_jobs.values():
+        counts[job.state] = counts.get(job.state, 0) + 1
+    return {
+        "version": API_VERSION,
+        "pool": {
+            "accounts": _playback_pool.size,
+            "available": _playback_pool.available,
+            "leases": _playback_pool.report(),
+        },
+        "jobs": counts,
+        "oldestJobAgeSeconds": round(
+            max((time.time() - job.created_at for job in _playback_jobs.values()), default=0.0),
+            1,
+        ),
+        "limits": {
+            "leaseTimeoutSeconds": PLAYBACK_LEASE_TIMEOUT,
+            "jobTimeoutSeconds": PLAYBACK_JOB_TIMEOUT,
+            "maxPendingJobs": PLAYBACK_MAX_PENDING_JOBS,
+        },
+    }
+
+
 @app.get("/playback/requests/{request_id}")
 async def get_playback_request(request_id: str):
     """Poll a playback request that was accepted with HTTP 202."""
@@ -1017,7 +1225,8 @@ async def get_track(id: int, quality: str = "HI_RES_LOSSLESS", immersiveaudio: b
         "immersiveaudio": immersiveaudio
     }
     return await dispatch_playback_request(
-        lambda cred: make_playback_request_for_cred(cred, track_url, params=params)
+        lambda cred: make_playback_request_for_cred(cred, track_url, params=params),
+        key=("track", id, quality, immersiveaudio),
     )
 
 
@@ -1053,7 +1262,10 @@ async def get_track_manifests(
             pass
         return res
 
-    return await dispatch_playback_request(fetch_manifest)
+    return await dispatch_playback_request(
+        fetch_manifest,
+        key=("manifest", id, tuple(formats), adaptive, manifestType, uriScheme, usage),
+    )
 
 # Not really necessary but I'm including it anyway
 @app.api_route("/widevine", methods=["GET", "POST"])
@@ -1696,7 +1908,10 @@ async def get_video(
         )
         return {"version": API_VERSION, "video": data}
 
-    return await dispatch_playback_request(fetch_video)
+    return await dispatch_playback_request(
+        fetch_video,
+        key=("video", id, quality, mode, presentation),
+    )
 
 
 if __name__ == "__main__":
